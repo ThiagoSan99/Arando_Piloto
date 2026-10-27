@@ -1,0 +1,21 @@
+
+# ============================================
+# ARANDO LA EDUCACIÓN
+# Dependencias del backend
+# ============================================
+
+# Framework principal
+Django==6.1.2
+
+# API REST
+djangorestframework
+
+# Conexión con PostgreSQL
+# Conservar el controlador instalado actualmente:
+# psycopg[binary] o psycopg2-binary
+
+# Integración con KoboToolbox
+requests
+
+# Variables de entorno (.env)
+python-dotenv

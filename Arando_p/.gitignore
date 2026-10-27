@@ -1,0 +1,150 @@
+
+# ==================================================
+# ARANDO LA EDUCACIÓN
+# Git Ignore - Django / Python / PostgreSQL
+# ==================================================
+
+# --------------------------------------------------
+# 1. ENTORNOS VIRTUALES
+# --------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+virtualenv/
+
+# --------------------------------------------------
+# 2. PYTHON - CACHÉ Y ARCHIVOS COMPILADOS
+# --------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.so
+
+# --------------------------------------------------
+# 3. VARIABLES DE ENTORNO Y SECRETOS
+# --------------------------------------------------
+.env
+.env.*
+!.env.example
+
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+
+secrets.json
+credentials.json
+service-account*.json
+
+# Configuración local con posibles credenciales
+config/settings_local.py
+local_settings.py
+
+# --------------------------------------------------
+# 4. DJANGO
+# --------------------------------------------------
+*.log
+db.sqlite3
+db.sqlite3-journal
+
+staticfiles/
+collected_static/
+media/
+uploads/
+
+# Mantener los archivos de migraciones en Git.
+# NO ignorar seguimiento/migrations/
+
+# --------------------------------------------------
+# 5. POSTGRESQL Y RESPALDOS
+# --------------------------------------------------
+*.sql
+*.sql.gz
+*.dump
+*.backup
+*.bak
+
+backups/
+respaldos/
+database_backups/
+
+# --------------------------------------------------
+# 6. DATOS INSTITUCIONALES Y KOBO
+# --------------------------------------------------
+datos_privados/
+datos_reales/
+datos_sensibles/
+importaciones_privadas/
+
+exports/
+exportaciones/
+kobo_exports/
+kobo_responses/
+
+# Archivo institucional de validación
+AE2026_Validacion_Telefonica_Estudiantes_v1.xlsx
+
+# --------------------------------------------------
+# 7. ARCHIVOS TEMPORALES Y PRUEBAS
+# --------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache/
+
+*.tmp
+*.temp
+*.swp
+*.swo
+
+# --------------------------------------------------
+# 8. VS CODE Y EDITORES
+# --------------------------------------------------
+.vscode/
+.idea/
+*.iml
+
+# --------------------------------------------------
+# 9. WINDOWS
+# --------------------------------------------------
+Thumbs.db
+Thumbs.db:encryptable
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# --------------------------------------------------
+# 10. DISTRIBUCIONES Y PAQUETES PYTHON
+# --------------------------------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# --------------------------------------------------
+# 11. JUPYTER
+# --------------------------------------------------
+.ipynb_checkpoints/
+
+# --------------------------------------------------
+# 12. ARCHIVOS LOCALES DE POWER BI
+# --------------------------------------------------
+*.pbix
+*.pbit
+*.pbip
+
+# --------------------------------------------------
+# 13. ARCHIVOS LOCALES DE DEPURACIÓN
+# --------------------------------------------------
+debug/
+tmp/
+temp/
+logs/
