@@ -120,9 +120,9 @@ class HorarioListView(BaseListView):
 
 class SesionClaseListView(BaseListView):
     queryset = SesionClase.objects.select_related(
-        "horario__aula",
-        "horario__clei",
-        "horario__docente",
+        "aula",
+        "clei",
+        "docente",
     ).all()
     serializer_class = SesionClaseSerializer
 

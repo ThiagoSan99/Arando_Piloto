@@ -1,6 +1,13 @@
 from django.db import models
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.core.validators import RegexValidator
+import uuid
+
+
+class FormatoRegistroKobo(models.TextChoices):
+    INDIVIDUAL = "INDIVIDUAL", "Individual"
+    GRUPAL_V1 = "GRUPAL_V1", "Grupal por campos de estudiante"
 
 class Proyecto(models.Model):
     nombre = models.CharField(max_length=200)
@@ -380,7 +387,22 @@ class SesionClase(models.Model):
     horario = models.ForeignKey(
         Horario,
         on_delete=models.PROTECT,
-        related_name="sesiones"
+        related_name="sesiones",
+        null=True,
+        blank=True,
+    )
+    aula = models.ForeignKey(
+        Aula, on_delete=models.PROTECT, related_name="sesiones",
+    )
+    clei = models.ForeignKey(
+        CLEI, on_delete=models.PROTECT, related_name="sesiones",
+    )
+    docente = models.ForeignKey(
+        Docente, on_delete=models.PROTECT, related_name="sesiones",
+    )
+    asignacion = models.ForeignKey(
+        "AsignacionDocenteCLEI", on_delete=models.PROTECT,
+        related_name="sesiones", null=True, blank=True,
     )
 
     fecha = models.DateField()
@@ -404,8 +426,52 @@ class SesionClase(models.Model):
         verbose_name_plural = "Sesiones de clase"
         ordering = ["-fecha", "hora_inicio"]
 
+        constraints = [
+            models.UniqueConstraint(
+                fields=["aula", "clei", "docente", "fecha", "hora_inicio"],
+                name="sesion_grupo_docente_fecha_inicio_unica",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(hora_fin__gt=models.F("hora_inicio")),
+                name="sesion_fin_posterior_inicio",
+            ),
+        ]
+
+    def _completar_contexto_desde_horario(self):
+        """Compatibilidad con los creadores de sesiones del piloto anterior."""
+        completados = []
+        if self.horario_id:
+            for campo in ("aula", "clei", "docente"):
+                if getattr(self, f"{campo}_id") is None:
+                    setattr(self, f"{campo}_id", getattr(self.horario, f"{campo}_id"))
+                    completados.append(campo)
+        return completados
+
+    def full_clean(self, *args, **kwargs):
+        self._completar_contexto_desde_horario()
+        return super().full_clean(*args, **kwargs)
+
+    def save(self, *args, **kwargs):
+        completados = self._completar_contexto_desde_horario()
+        if kwargs.get("update_fields") and completados:
+            kwargs["update_fields"] = set(kwargs["update_fields"]) | set(completados)
+        return super().save(*args, **kwargs)
+
     def clean(self):
         from django.core.exceptions import ValidationError
+
+        super().clean()
+        for relacion in ("horario", "asignacion"):
+            if getattr(self, f"{relacion}_id"):
+                contexto = getattr(self, relacion)
+                if any(
+                    getattr(self, f"{campo}_id") != getattr(contexto, f"{campo}_id")
+                    for campo in ("aula", "clei", "docente")
+                ):
+                    raise ValidationError({relacion: "El contexto no coincide con la sesión."})
+        if self.aula_id and self.docente_id:
+            if self.aula.institucion_id != self.docente.institucion_id:
+                raise ValidationError("El docente y el aula deben pertenecer a la misma institución.")
 
         if self.hora_inicio and self.hora_fin:
             if self.hora_inicio >= self.hora_fin:
@@ -419,8 +485,8 @@ class SesionClase(models.Model):
     def __str__(self):
         return (
             f"{self.fecha} - "
-            f"{self.horario.clei.codigo} - "
-            f"{self.horario.aula.nombre}"
+            f"{self.clei.codigo} - "
+            f"{self.aula.nombre}"
         )
 
 class Asistencia(models.Model):
@@ -472,12 +538,12 @@ class Asistencia(models.Model):
         from django.core.exceptions import ValidationError
 
         if self.estudiante_id and self.sesion_id:
-            if self.estudiante.aula_id != self.sesion.horario.aula_id:
+            if self.estudiante.aula_id != self.sesion.aula_id:
                 raise ValidationError(
                     "El estudiante no pertenece al aula de esta sesión."
                 )
 
-            if self.estudiante.clei_id != self.sesion.horario.clei_id:
+            if self.estudiante.clei_id != self.sesion.clei_id:
                 raise ValidationError(
                     "El CLEI del estudiante no corresponde al de la sesión."
                 )
@@ -599,6 +665,14 @@ class RegistroImportacionKobo(models.Model):
     )
 
     envio_id = models.BigIntegerField()
+
+    formato = models.CharField(
+        max_length=20, choices=FormatoRegistroKobo.choices,
+        default=FormatoRegistroKobo.INDIVIDUAL,
+    )
+    asistencias = models.ManyToManyField(
+        Asistencia, through="DetalleImportacionKobo", related_name="importaciones_kobo_multiples",
+    )
 
     envio_uuid = models.CharField(
         max_length=100,
@@ -806,6 +880,104 @@ class AsignacionDocenteCLEI(models.Model):
             f"CLEI {self.clei.codigo}"
         )
 
+class FormularioKobo(models.Model):
+    """Contexto institucional autorizado para un formulario de un grupo.
+
+    La vigencia de la asignación docente se comprobará para la fecha de cada
+    sesión al procesar el envío. Esta configuración no acredita por sí sola
+    la identidad de la persona que utiliza el formulario.
+    """
+
+    formulario_uid = models.CharField(max_length=100, unique=True)
+    formato = models.CharField(
+        max_length=20, choices=FormatoRegistroKobo.choices,
+        default=FormatoRegistroKobo.INDIVIDUAL,
+    )
+    docente = models.ForeignKey(
+        Docente,
+        on_delete=models.PROTECT,
+        related_name="formularios_kobo",
+    )
+    aula = models.ForeignKey(
+        Aula,
+        on_delete=models.PROTECT,
+        related_name="formularios_kobo",
+    )
+    clei = models.ForeignKey(
+        CLEI,
+        on_delete=models.PROTECT,
+        related_name="formularios_kobo",
+    )
+    activo = models.BooleanField(default=True)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+    fecha_actualizacion = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Formulario Kobo"
+        verbose_name_plural = "Formularios Kobo"
+        ordering = ["formulario_uid"]
+
+    def clean(self):
+        super().clean()
+
+        if self.docente_id and self.aula_id:
+            if self.docente.institucion_id != self.aula.institucion_id:
+                raise ValidationError({
+                    "docente": (
+                        "El docente debe pertenecer a la misma institución "
+                        "del aula del formulario."
+                    )
+                })
+
+    def __str__(self):
+        return self.formulario_uid
+
+
+class CampoAsistenciaKobo(models.Model):
+    formulario = models.ForeignKey(
+        FormularioKobo, on_delete=models.CASCADE, related_name="campos_asistencia",
+    )
+    campo = models.CharField(
+        max_length=100,
+        validators=[RegexValidator(r"^asistencia_[a-z0-9_]+$", "Usa un campo asistencia_ válido.")],
+    )
+    estudiante = models.ForeignKey(
+        Estudiante, on_delete=models.PROTECT, related_name="campos_formulario_kobo",
+    )
+
+    class Meta:
+        ordering = ["estudiante_id"]
+        constraints = [
+            models.UniqueConstraint(fields=["formulario", "campo"], name="campo_unico_por_formulario_kobo"),
+            models.UniqueConstraint(fields=["formulario", "estudiante"], name="estudiante_unico_por_formulario_kobo"),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.formulario_id and self.estudiante_id:
+            if (self.estudiante.aula_id != self.formulario.aula_id
+                    or self.estudiante.clei_id != self.formulario.clei_id):
+                raise ValidationError("El estudiante no corresponde al grupo del formulario.")
+
+    def __str__(self):
+        return self.campo
+
+
+class DetalleImportacionKobo(models.Model):
+    importacion = models.ForeignKey(
+        RegistroImportacionKobo, on_delete=models.CASCADE, related_name="detalles",
+    )
+    asistencia = models.ForeignKey(
+        Asistencia, on_delete=models.PROTECT, related_name="detalles_importacion_kobo",
+    )
+    campo_formulario = models.CharField(max_length=100, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(
+            fields=["importacion", "asistencia"], name="detalle_importacion_asistencia_unico",
+        )]
+
+
 class RevalidacionAsistencia(models.Model):
 
     class Decision(models.TextChoices):
@@ -872,6 +1044,57 @@ class RevalidacionAsistencia(models.Model):
             f"Revalidación {self.id} - "
             f"{self.decision}"
         )
+
+
+class NotificacionAusencia(models.Model):
+    class Estado(models.TextChoices):
+        PENDIENTE = "PENDIENTE", "Pendiente"
+        ENVIANDO = "ENVIANDO", "Enviando"
+        ENVIADA = "ENVIADA", "Aceptada por SMTP"
+        FALLIDA = "FALLIDA", "Fallida, reintentable"
+        INCIERTA = "INCIERTA", "Entrega incierta, requiere revisión"
+        OMITIDA = "OMITIDA", "Ya no pertinente"
+        BLOQUEADA = "BLOQUEADA", "Falta configuración"
+
+    asistencia = models.ForeignKey(
+        Asistencia, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="notificaciones_correo",
+    )
+    # Se conserva la identidad aunque una limpieza autorizada retire la asistencia.
+    asistencia_referencia = models.PositiveBigIntegerField()
+    caso = models.ForeignKey("CasoAlerta", on_delete=models.SET_NULL, null=True, blank=True)
+    destinatario = models.EmailField(blank=True)
+    asunto = models.CharField(max_length=255)
+    cuerpo = models.TextField()
+    estado = models.CharField(max_length=12, choices=Estado.choices, default=Estado.PENDIENTE)
+    origen = models.CharField(max_length=30, default="AUTOMATICA")
+    identificador = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    intentos = models.PositiveIntegerField(default=0)
+    ultimo_error = models.CharField(max_length=100, blank=True)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+    fecha_actualizacion = models.DateTimeField(auto_now=True)
+    fecha_envio = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(
+            fields=["asistencia_referencia", "destinatario"], name="correo_ausencia_destinatario_unico",
+        )]
+
+
+class IntentoNotificacionAusencia(models.Model):
+    notificacion = models.ForeignKey(NotificacionAusencia, on_delete=models.CASCADE, related_name="historial_intentos")
+    numero = models.PositiveIntegerField()
+    estado = models.CharField(max_length=12)
+    fase = models.CharField(max_length=20)
+    tipo_error = models.CharField(max_length=100, blank=True)
+    codigo_smtp = models.PositiveSmallIntegerField(null=True, blank=True)
+    fecha_inicio = models.DateTimeField(auto_now_add=True)
+    fecha_fin = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(
+            fields=["notificacion", "numero"], name="intento_correo_numero_unico",
+        )]
 
 
 class CasoAlerta(models.Model):

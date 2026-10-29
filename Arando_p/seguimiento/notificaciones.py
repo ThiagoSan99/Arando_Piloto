@@ -57,9 +57,9 @@ def enviar_correo_alerta(alerta_id):
 
 
 
-def enviar_correo_caso_alerta(caso_id, asistencia_id):
+def construir_correo_caso_alerta(caso_id, asistencia_id):
     """
-    Envía una notificación por cada nueva ausencia
+    Construye el contenido de una notificación por cada nueva ausencia
     registrada desde KoboToolbox.
 
     Incluye:
@@ -93,26 +93,20 @@ def enviar_correo_caso_alerta(caso_id, asistencia_id):
         if correo.strip()
     ]
 
-    if not destinatarios:
-        raise ValueError(
-            "No hay destinatarios configurados "
-            "en ARANDO_ALERT_EMAIL."
-        )
-
     # 2. Obtener el caso y su información institucional
     caso = CasoAlerta.objects.select_related(
         "estudiante__aula__institucion__zona"
     ).get(pk=caso_id)
 
     estudiante = caso.estudiante
-    aula = estudiante.aula
-    institucion = aula.institucion
-    zona = institucion.zona
 
     # 3. Obtener la asistencia que generó la notificación
     asistencia = Asistencia.objects.select_related(
-        "sesion"
+        "sesion__aula__institucion__zona"
     ).get(pk=asistencia_id)
+    aula = asistencia.sesion.aula
+    institucion = aula.institucion
+    zona = institucion.zona
 
     # Comprobar que la asistencia pertenece al estudiante
     if asistencia.estudiante_id != estudiante.id:
@@ -162,6 +156,8 @@ def enviar_correo_caso_alerta(caso_id, asistencia_id):
         "INFORMACIÓN DEL ESTUDIANTE\n\n"
         f"Código: {estudiante.codigo}\n"
         f"Fecha de la sesión: {fecha_sesion}\n"
+        f"Hora de inicio: {asistencia.sesion.hora_inicio:%H:%M}\n"
+        f"Hora de finalización: {asistencia.sesion.hora_fin:%H:%M}\n"
         f"ID de asistencia: {asistencia.id}\n\n"
 
         "ESTADO DE ALERTA ACADÉMICA\n\n"
@@ -188,11 +184,12 @@ def enviar_correo_caso_alerta(caso_id, asistencia_id):
         "Notificación automática del prototipo Arando.\n"
     )
 
-    # 9. Enviar el correo
-    return send_mail(
-        subject=asunto,
-        message=mensaje,
-        from_email=None,
-        recipient_list=destinatarios,
-        fail_silently=False
-    )
+    return {"subject": asunto, "message": mensaje, "recipient_list": destinatarios}
+
+
+def enviar_correo_caso_alerta(caso_id, asistencia_id):
+    """Compatibilidad para llamadas individuales; el importador usa el registro persistente."""
+    correo = construir_correo_caso_alerta(caso_id, asistencia_id)
+    if not correo["recipient_list"]:
+        raise ValueError("No hay destinatarios configurados en ARANDO_ALERT_EMAIL.")
+    return send_mail(**correo, from_email=None, fail_silently=False)

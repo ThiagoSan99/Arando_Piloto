@@ -321,17 +321,17 @@ class HorarioSerializer(serializers.ModelSerializer):
 class SesionClaseSerializer(serializers.ModelSerializer):
 
     aula_nombre = serializers.CharField(
-        source="horario.aula.nombre",
+        source="aula.nombre",
         read_only=True
     )
 
     clei_codigo = serializers.CharField(
-        source="horario.clei.codigo",
+        source="clei.codigo",
         read_only=True
     )
 
     docente_codigo = serializers.CharField(
-        source="horario.docente.codigo",
+        source="docente.codigo",
         read_only=True
     )
 
@@ -340,6 +340,10 @@ class SesionClaseSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "horario",
+            "aula",
+            "clei",
+            "docente",
+            "asignacion",
             "aula_nombre",
             "clei_codigo",
             "docente_codigo",

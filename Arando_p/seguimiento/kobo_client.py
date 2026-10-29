@@ -6,12 +6,18 @@ import requests
 class KoboClient:
     BASE_URL = "https://kf.kobotoolbox.org/api/v2"
 
+    LEGACY_FORM_UID = "aS3JhBzNuufeAQMPAQN3jX"
+
     FORM_UID = os.getenv(
         "KOBO_FORM_UID",
-        "aS3JhBzNuufeAQMPAQN3jX"
+        LEGACY_FORM_UID
     )
 
-    def __init__(self):
+    def __init__(self, formulario_uid=None):
+        # El origen lo elige el backend, nunca el contenido del envío.
+        self.FORM_UID = (
+            formulario_uid if formulario_uid is not None else type(self).FORM_UID
+        )
         self.token = os.environ.get("KOBO_API_TOKEN")
 
         if not self.token:

@@ -1,6 +1,8 @@
 from .models import Asistencia, Alerta
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q
+from django.utils import timezone
+from zoneinfo import ZoneInfo
 
 import logging
 logger = logging.getLogger(__name__)
@@ -130,10 +132,107 @@ from .models import (
     Estudiante,
     SesionClase,
     Asistencia,
+    FormularioKobo,
+    AsignacionDocenteCLEI,
 )
 
 
-def validar_asistencia_kobo(registro):
+def validar_contexto_formulario_kobo(registro, formulario_uid):
+    """Contrasta los códigos recibidos con la configuración del backend.
+
+    Solo el formulario original conserva la compatibilidad sin vinculación.
+    No acredita la identidad de quien tiene acceso al enlace de Kobo.
+    """
+    formulario = FormularioKobo.objects.select_related(
+        "docente", "aula__institucion", "clei"
+    ).filter(formulario_uid=formulario_uid).first()
+
+    if formulario is None:
+        if formulario_uid == KoboClient.LEGACY_FORM_UID:
+            return None
+        raise ValidationError(
+            "El formulario Kobo no tiene un grupo autorizado configurado."
+        )
+
+    if not formulario.activo:
+        raise ValidationError("El formulario Kobo está desactivado.")
+
+    formulario.full_clean()
+    if not all((
+        formulario.docente.activo,
+        formulario.aula.activa,
+        formulario.aula.institucion.activa,
+        formulario.clei.activo,
+    )):
+        raise ValidationError("El contexto institucional del formulario está inactivo.")
+
+    esperados = {
+        "codigo_docente": formulario.docente.codigo,
+        "codigo_institucion": formulario.aula.institucion.codigo_kobo,
+        "codigo_aula": formulario.aula.codigo_kobo,
+        "clei": formulario.clei.codigo,
+    }
+    for campo, esperado in esperados.items():
+        if not esperado or registro.get(campo) != esperado:
+            raise ValidationError({
+                campo: "El dato no corresponde al grupo autorizado del formulario."
+            })
+
+    return formulario
+
+
+def validar_fecha_horas_kobo(registro):
+    """Valida los valores completos y conserva la hora local enviada por Kobo."""
+    try:
+        fecha = date.fromisoformat(registro["fecha_sesion"])
+    except (ValueError, TypeError):
+        raise ValidationError({"fecha_sesion": "La fecha de sesión no es válida."})
+
+    if fecha > timezone.localdate(timezone=ZoneInfo("America/Bogota")):
+        raise ValidationError({"fecha_sesion": "No se admiten clases con fechas futuras."})
+
+    horas = {}
+    for campo in ("hora_inicio", "hora_fin"):
+        valor = registro.get(campo)
+        if campo == "hora_fin" and valor in (None, ""):
+            horas[campo] = None
+            continue
+        try:
+            # Kobo puede incluir segundos, fracciones y desplazamiento horario.
+            # Los TimeField existentes almacenan la hora local sin zona.
+            horas[campo] = time.fromisoformat(valor).replace(tzinfo=None)
+        except (ValueError, TypeError):
+            raise ValidationError({campo: "La hora de sesión no es válida."})
+
+    if horas["hora_fin"] is not None and horas["hora_inicio"] >= horas["hora_fin"]:
+        raise ValidationError({
+            "hora_fin": "La hora de finalización debe ser posterior a la de inicio."
+        })
+
+    return fecha, horas["hora_inicio"], horas["hora_fin"]
+
+
+def obtener_matricula_kobo(estudiante, aula, clei, fecha, bloquear=False):
+    matriculas = MatriculaCLEI.objects.filter(
+        estudiante=estudiante,
+        aula=aula,
+        clei=clei,
+        estado=MatriculaCLEI.Estado.EN_CURSO,
+        fecha_inicio__lte=fecha,
+    ).filter(Q(fecha_fin__isnull=True) | Q(fecha_fin__gte=fecha))
+    if bloquear:
+        matriculas = matriculas.select_for_update()
+    matricula = matriculas.first()
+
+    if matricula is None:
+        raise ValidationError(
+            "No se encontró una matrícula CLEI vigente para el estudiante, "
+            "aula y fecha de la sesión."
+        )
+    return matricula
+
+
+def validar_asistencia_kobo(registro, formulario_uid=None):
     """
     Valida una respuesta de KoboToolbox.
 
@@ -156,6 +255,29 @@ def validar_asistencia_kobo(registro):
         if not registro.get(campo):
             raise ValidationError(
                 f"Falta el campo obligatorio: {campo}"
+            )
+
+    formulario_uid = (
+        formulario_uid if formulario_uid is not None else KoboClient.FORM_UID
+    )
+    formulario = validar_contexto_formulario_kobo(registro, formulario_uid)
+    fecha, hora, hora_fin = validar_fecha_horas_kobo(registro)
+
+    asignacion = None
+    if formulario is not None:
+        if hora_fin is None:
+            raise ValidationError({"hora_fin": "Falta la hora de finalización."})
+        asignacion = AsignacionDocenteCLEI.objects.filter(
+            docente=formulario.docente,
+            aula=formulario.aula,
+            clei=formulario.clei,
+            activa=True,
+            fecha_inicio__lte=fecha,
+        ).filter(Q(fecha_fin__isnull=True) | Q(fecha_fin__gte=fecha)).first()
+        if asignacion is None:
+            raise ValidationError(
+                "El docente no tiene una asignación activa y vigente "
+                "para el grupo y la fecha de la sesión."
             )
 
     # Identificar institución y aula
@@ -196,30 +318,39 @@ def validar_asistencia_kobo(registro):
         )
 
     # Identificar la sesión correspondiente
-    fecha = date.fromisoformat(registro["fecha_sesion"])
-
-    hora = time.fromisoformat(
-        registro["hora_inicio"][:8]
-    )
-
-    sesion = SesionClase.objects.get(
+    sesiones = SesionClase.objects.filter(
         fecha=fecha,
         hora_inicio=hora,
-        horario__aula=aula,
-        horario__clei=clei,
-        horario__docente=docente
+        aula=aula,
+        clei=clei,
+        docente=docente,
     )
+    sesion = sesiones.first()
+    if sesion is None and formulario is None:
+        # Sin hora final ni contexto autorizado no se inventa una clase histórica.
+        raise SesionClase.DoesNotExist("No existe la sesión del formulario original.")
 
-    if sesion.estado != SesionClase.Estado.REALIZADA:
+    permitidos = [SesionClase.Estado.REALIZADA]
+    if formulario is not None:
+        permitidos.append(SesionClase.Estado.PROGRAMADA)
+    if sesion is not None and sesion.estado not in permitidos:
         raise ValidationError(
             "La sesión no está marcada como REALIZADA."
         )
+
+    if sesion is not None and hora_fin is not None and sesion.hora_fin != hora_fin:
+        raise ValidationError({
+            "hora_fin": "La hora final no coincide con la sesión existente."
+        })
+
+    if formulario is not None:
+        obtener_matricula_kobo(estudiante, aula, clei, fecha)
 
     # Comprobar si la asistencia ya existe
     asistencia_existente = Asistencia.objects.filter(
         estudiante=estudiante,
         sesion=sesion
-    ).first()
+    ).first() if sesion is not None else None
 
     if asistencia_existente:
         if asistencia_existente.estado != estado:
@@ -235,7 +366,14 @@ def validar_asistencia_kobo(registro):
     return {
         "envio_id": registro.get("_id"),
         "estudiante_id": estudiante.id,
-        "sesion_id": sesion.id,
+        "sesion_id": sesion.id if sesion is not None else None,
+        "aula_id": aula.pk,
+        "clei_id": clei.pk,
+        "docente_id": docente.pk,
+        "asignacion_id": asignacion.pk if asignacion is not None else None,
+        "fecha": fecha,
+        "hora_inicio": hora,
+        "hora_fin": hora_fin,
         "estado": estado,
         "resultado": resultado,
     }
@@ -246,188 +384,52 @@ from .kobo_client import KoboClient
 
 
 @transaction.atomic
-def procesar_respuesta_kobo(registro):
-    """
-    Procesa una respuesta de KoboToolbox.
-
-    - Valida los datos recibidos.
-    - Evita asistencias duplicadas.
-    - Crea asistencias nuevas.
-    - Registra la trazabilidad de la importación.
-    - Actualiza el caso único de alerta.
-    - Notifica por cada nueva ausencia.
-    """
-
-    formulario_uid = KoboClient.FORM_UID
-    envio_id = registro.get("_id")
-
-    if envio_id is None:
-        raise ValueError(
-            "La respuesta no contiene el identificador _id."
+def obtener_o_crear_sesion_validada(datos):
+    """Servicio interno: recibe el resultado validado, con sus bloqueos adquiridos."""
+    identidad = {campo: datos[campo] for campo in (
+        "aula_id", "clei_id", "docente_id", "fecha", "hora_inicio"
+    )}
+    sesion = SesionClase.objects.select_for_update().filter(**identidad).first()
+    creada = False
+    if sesion is None:
+        if datos["asignacion_id"] is None or datos["hora_fin"] is None:
+            raise ValidationError("Crear una sesión requiere asignación y hora final.")
+        candidata = SesionClase(
+            **identidad, hora_fin=datos["hora_fin"],
+            asignacion_id=datos["asignacion_id"], estado=SesionClase.Estado.REALIZADA,
         )
+        candidata.full_clean(validate_unique=False, validate_constraints=False)
+        try:
+            with transaction.atomic():
+                candidata.save(force_insert=True)
+            sesion, creada = candidata, True
+        except IntegrityError:
+            # Una escritura concurrente puede haber ganado la clave única.
+            # El savepoint mantiene utilizable la transacción exterior.
+            sesion = SesionClase.objects.select_for_update().filter(**identidad).first()
+            if sesion is None:
+                raise
 
-    envio_id = int(envio_id)
-
-    # 1. Verificar si el envío ya fue procesado
-    importacion = RegistroImportacionKobo.objects.filter(
-        formulario_uid=formulario_uid,
-        envio_id=envio_id
-    ).first()
-
-    if importacion:
-        return {
-            "envio_id": envio_id,
-            "estado": importacion.estado,
-            "asistencia_id": importacion.asistencia_id,
-            "importacion_creada": False,
-            "asistencia_creada": False,
-        }
-
-    # 2. Validar los datos recibidos
-    resultado = validar_asistencia_kobo(registro)
-
-    # 3. Bloquear al estudiante durante la transacción
-    estudiante = Estudiante.objects.select_for_update().get(
-        pk=resultado["estudiante_id"]
-    )
-
-    sesion = SesionClase.objects.get(
-        pk=resultado["sesion_id"]
-    )
-
-    estado_recibido = resultado["estado"]
-
-    # 4. Comprobar nuevamente después del bloqueo
-    importacion = RegistroImportacionKobo.objects.filter(
-        formulario_uid=formulario_uid,
-        envio_id=envio_id
-    ).first()
-
-    if importacion:
-        return {
-            "envio_id": envio_id,
-            "estado": importacion.estado,
-            "asistencia_id": importacion.asistencia_id,
-            "importacion_creada": False,
-            "asistencia_creada": False,
-        }
-
-    # 5. Buscar si ya existe la asistencia
-    asistencia = Asistencia.objects.filter(
-        estudiante=estudiante,
-        sesion=sesion
-    ).first()
-
-    asistencia_creada = False
-
-    if asistencia:
-
-        if asistencia.estado != estado_recibido:
-            raise ValueError(
-                "La asistencia existente tiene "
-                "un estado diferente."
-            )
-
-        estado_importacion = (
-            RegistroImportacionKobo.Estado.EXISTENTE
-        )
-
-    else:
-
-        # Buscar la matrícula válida del estudiante
-    # para el aula, CLEI y fecha de la sesión.
-        matricula = (
-            MatriculaCLEI.objects.filter(
-                estudiante=estudiante,
-                aula=sesion.horario.aula,
-                clei=sesion.horario.clei,
-                estado="EN_CURSO",
-                fecha_inicio__lte=sesion.fecha
-            )
-            .filter(
-                Q(fecha_fin__isnull=True)
-                | Q(fecha_fin__gte=sesion.fecha)
-            )
-            .first()
-        )
-
-        if matricula is None:
-            raise ValueError(
-                "No se encontró una matrícula CLEI "
-                "vigente para el estudiante, aula "
-                "y fecha de la sesión."
-            )
-
-        # Crear asistencia asociada a la matrícula
-        asistencia = Asistencia(
-            estudiante=estudiante,
-            sesion=sesion,
-            matricula=matricula,
-            estado=estado_recibido
-        )
-
-        asistencia.full_clean()
-        asistencia.save()
-
-        asistencia_creada = True
-
-        estado_importacion = (
-            RegistroImportacionKobo.Estado.CREADA
-        )
+    if datos["hora_fin"] is not None and sesion.hora_fin != datos["hora_fin"]:
+        raise ValidationError({"hora_fin": "La sesión existente tiene otra hora final."})
+    if sesion.estado == SesionClase.Estado.PROGRAMADA and datos["asignacion_id"]:
+        # El envío válido constituye la confirmación aprobada de clase impartida.
+        sesion.estado = SesionClase.Estado.REALIZADA
+        sesion.asignacion_id = datos["asignacion_id"]
+        sesion.full_clean()
+        sesion.save(update_fields=["estado", "asignacion", "fecha_actualizacion"])
+    if sesion.estado != SesionClase.Estado.REALIZADA:
+        raise ValidationError("La sesión cancelada o reprogramada no admite asistencia.")
+    return sesion, creada
 
 
-    # 6. Registrar el envío de KoboToolbox
-    importacion = RegistroImportacionKobo(
-        formulario_uid=formulario_uid,
-        envio_id=envio_id,
-        envio_uuid=str(
-            registro.get("_uuid") or ""
-        ),
-        asistencia=asistencia,
-        estado=estado_importacion
-    )
-
-    importacion.full_clean()
-    importacion.save()
-
-    # 7. Actualizar el caso y programar la notificación
-    # únicamente cuando se crea una nueva ausencia.
-    if (
-        asistencia_creada
-        and estado_recibido == Asistencia.Estado.AUSENTE
-    ):
-
-        caso, caso_creado, caso_actualizado = (
-            actualizar_caso_alerta(
-                estudiante,
-                crear_si_no_existe=True
-            )
-        )
-
-        if caso is not None:
-
-            # Ejecutar el envío de correo después
-            # de confirmar la transacción en PostgreSQL.
-            transaction.on_commit(
-                lambda caso_id=caso.id,
-                       asistencia_id=asistencia.id:
-                    notificar_caso_alerta_segura(
-                        caso_id,
-                        asistencia_id
-                    )
-            )
-
-    # 8. Devolver el resultado de la importación
-    return {
-        "envio_id": envio_id,
-        "estado": importacion.estado,
-        "asistencia_id": asistencia.id,
-        "importacion_creada": True,
-        "asistencia_creada": asistencia_creada,
-    }
+def procesar_respuesta_kobo(registro, formulario_uid=None):
+    """Procesa un envío individual o grupal mediante el importador transaccional."""
+    from .kobo_importador import procesar
+    return procesar(registro, formulario_uid=formulario_uid)
 
 
-def sincronizar_asistencias_kobo(limite=100):
+def sincronizar_asistencias_kobo(limite=100, formulario_uid=None):
     """
     Sincroniza todas las respuestas de KoboToolbox.
 
@@ -435,7 +437,7 @@ def sincronizar_asistencias_kobo(limite=100):
     no la cantidad total de respuestas procesadas.
     """
 
-    cliente = KoboClient()
+    cliente = KoboClient(formulario_uid=formulario_uid) if formulario_uid is not None else KoboClient()
 
     resumen = {
         "respuestas_consultadas": 0,
@@ -451,16 +453,18 @@ def sincronizar_asistencias_kobo(limite=100):
         resumen["respuestas_consultadas"] += 1
 
         try:
-            resultado = procesar_respuesta_kobo(registro)
+            resultado = procesar_respuesta_kobo(
+                registro, formulario_uid=cliente.FORM_UID
+            )
 
-            if resultado["asistencia_creada"]:
-                resumen["asistencias_creadas"] += 1
-
-            elif not resultado["importacion_creada"]:
+            if not resultado["importacion_creada"]:
                 resumen["envios_ya_procesados"] += 1
-
             else:
-                resumen["asistencias_existentes"] += 1
+                resumen["asistencias_creadas"] += resultado["asistencias_creadas"]
+                resumen["asistencias_existentes"] += resultado["asistencias_existentes"]
+            for campo, cantidad in resultado.get("notificaciones", {}).items():
+                clave = f"correos_{campo}"
+                resumen[clave] = resumen.get(clave, 0) + cantidad
 
         except Exception as error:
             resumen["errores"].append({
@@ -641,15 +645,12 @@ def notificar_caso_alerta_segura(caso_id, asistencia_id):
     """
 
     import logging
-    from .notificaciones import enviar_correo_caso_alerta
+    from .correo_persistente import enviar_pendientes_de_asistencia
 
     logger = logging.getLogger(__name__)
 
     try:
-        enviar_correo_caso_alerta(
-            caso_id=caso_id,
-            asistencia_id=asistencia_id
-        )
+        return enviar_pendientes_de_asistencia(asistencia_id)
 
     except Exception:
         logger.exception(
@@ -658,4 +659,5 @@ def notificar_caso_alerta_segura(caso_id, asistencia_id):
             caso_id,
             asistencia_id
         )
+        return {"ERROR_INTERNO": 1}
 
