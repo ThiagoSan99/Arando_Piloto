@@ -11,8 +11,7 @@ Django==6.1.2
 djangorestframework
 
 # Conexión con PostgreSQL
-# Conservar el controlador instalado actualmente:
-# psycopg[binary] o psycopg2-binary
+psycopg[binary]==3.3.6
 
 # Integración con KoboToolbox
 requests

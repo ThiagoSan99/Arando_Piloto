@@ -1,0 +1,13 @@
+# Copiar este archivo a .env y completar los valores en el equipo local.
+# PostgreSQL local (arando_db, usuario postgres, puerto 5432).
+ARANDO_DB_PASSWORD=
+
+# Integración con KoboToolbox.
+KOBO_API_TOKEN=
+# Descomentar solo si se necesita cambiar el UID del formulario legado.
+# KOBO_FORM_UID=
+
+# Correo SMTP y destinatarios de alertas separados por comas.
+ARANDO_EMAIL_USER=
+ARANDO_EMAIL_PASSWORD=
+ARANDO_ALERT_EMAIL=
